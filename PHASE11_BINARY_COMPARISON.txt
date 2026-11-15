@@ -1,0 +1,52 @@
+# PHASE11_BINARY_COMPARISON.txt
+========================================
+Machine-readable comparison: Resource #101 vs nl.bin
+========================================
+
+File: nl.bin
+Path: C:\Users\Intel i7 10700k\Desktop\MIAUSTAFF\FemboyLose-main\neverlose\bins\nl.bin
+Size: 55,578,624 bytes (0x3501000)
+SHA256: 682ce73b371349f87da6fd9365f8550e240dcdb97951e80445e70286275ad96e
+First 32 bytes: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+Last 32 bytes: 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47 47
+
+File: Resource #101 (IDR_BINARY) from neverlose.dll
+Path: C:\Users\Intel i7 10700k\Desktop\MIAUSTAFF\neverlose.dll (resource ID 101, RVA 0x0006D170)
+Size: 55,578,628 bytes (0x3501014)
+SHA256: c219ed6b999bfcc1346160b8f574278460c2ae1aaf04a2a8c1da02151b02d21d
+First 32 bytes: a6 c0 4e c9 43 77 21 63 34 62 62 31 74 23 6e 4c 2e 33 6e 63 2d 32 30 32 36 43 77 21 63 34 62 62
+Last 32 bytes: 74 29 24 6a 75 77 75 71 04 30 66 24 73 25 25 76 33 64 29 0b 69 74 29 24 6a 75 77 75 71 04 30 66
+
+Size difference: 4 bytes (resource #101 is 4 bytes larger)
+Common range: 55,578,624 bytes (full nl.bin length)
+Matching bytes in common range: 0
+Differing bytes in common range: 55,578,624
+First differing offset: 0x00000000 (byte 0)
+
+nl.bin is NOT a prefix of resource #101.
+Resource #101 is NOT a prefix of nl.bin.
+Files are COMPLETELY DIFFERENT (0% byte match in common range).
+
+Source code size analysis:
+- neverlose.h line 28: imageSize initialized to 0x3501000 (55,578,624)
+- neverlose.cpp line 34: imageSize = Size (from SizeofResource)
+- neverlose.cpp line 40: NtAllocateVirtualMemory with &imageSize
+- neverlose.cpp line 45: NtWriteVirtualMemory with imageSize bytes
+
+If SizeofResource returns 0x3501014 (55,578,628):
+- NtAllocateVirtualMemory would round UP to page granularity (0x1000 = 4096)
+- Result: 0x3502000 (55,579,648)
+- Observed allocation: 0x3501000 (55,578,624)
+- MISMATCH
+
+If SizeofResource returns 0x3501000 (55,578,624):
+- Allocation would be exactly 0x3501000 (55,578,624)
+- Matches observed allocation
+- But pefile reports resource size as 0x3501014 (55,578,628)
+- Contradiction between PE resource directory size and allocation size
+
+CONCLUSION: Resource #101 and nl.bin are COMPLETELY DIFFERENT files.
+The four-byte size difference cannot be explained by the available source code alone.
+
+---  
+*End of PHASE11_BINARY_COMPARISON.txt*
