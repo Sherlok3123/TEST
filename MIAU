@@ -1,0 +1,857 @@
+NATIVE REVERSE-ENGINEERING DUMP
+================================
+Archival export of confirmed native binary reverse-engineering findings.
+All findings were established through read-only live memory analysis of the
+running csgo.exe process plus static analysis of the mapped module. No binary
+or source file was modified during this investigation. No new investigation
+was performed for this document.
+
+========================================
+1. BINARY IDENTIFICATION
+========================================
+
+Module concept: The Neverlose cheat core is NOT the on-disk neverlose.dll.
+On-disk neverlose.dll (56,370,688 bytes, SHA256
+529C59BD687901D4E86898F78F50534CA4FC5611D693C296C9A3BD7BF8F61253) is a
+loader stub: pattern scans against it yield zero matches for every cheat
+signature. The real cheat code is manually mapped into the csgo.exe process
+address space.
+
+Architecture: x86 32-bit (little-endian). The csgo.exe process itself is
+32-bit; Get-Process.Modules reports only the WOW64 64-bit view, so all
+addresses below are 32-bit virtual addresses inside the manually mapped
+allocation.
+
+Allocation base: 0x412A0000
+Allocation size:   0x00DBA000 (3,410,614 bytes)
+Protection:        PAGE_EXECUTE_WRITECOPY (WCX)
+Anchor instruction: F3 0F 5B CA 0F 5B C9 0F 2E CB at 0x41400D8F
+   Used by get_base_address() in MUST UPDATE.txt to locate the region;
+   region.AllocationBase is returned as the module base.
+Scan delta:        0x340AB6 = furthest_addr 0x4158F57C - closest_addr 0x4124EAC6
+   Pattern scan_nl operates over [base, base + delta). This delta was
+   embedded in MUST UPDATE.txt memory.main.scan_nl and is consistent with
+   the mapped image extent.
+Continuation region: 0x4205A000, size 0x001DF000, protection R (read-only,
+   page-guard / NOACCESS guard pages adjacent).
+Small WCX thunk pages interspersed around the main allocation.
+Observed process: csgo.exe, confirmed running. PID was 8780 during the
+   earlier Phase 3 audit (working set ~1059 MB) and 21580 during this
+   Phase 5 investigation (working set ~1067 MB). All addresses below are
+   valid for PID 21580; they are module-relative so they are stable across
+   the same manual-mapping base.
+
+Source code availability: NONE for the native cheat core. The only source
+present in the workspace is FemboyLose-main/, which is the loader/injector
+source (C++) plus embedded Lua libraries — not the cheat core. bins\nl.bin
+(55,578,624 bytes) contains Lua standard library bytecode only; greps for
+aim/ragebot/hitscan/aimbot/aim_position/aim_angle/aim_origin/best_target
+return zero hits. Rust server code is networking/auth, not cheat logic.
+Therefore every address and function below was recovered from live process
+memory, not from source.
+
+========================================
+2. FUNCTION INVENTORY
+========================================
+
+Each entry: address, purpose, callers (direct E8), callees (known), confidence,
+evidence. "INFERRED" = reconstructed from disassembly but not independently
+confirmed as a distinct named function. "OBSERVED" = instruction bytes read
+and decoded from live memory.
+
+----------------------------------------
+0x413F94D0 — Lag-comp acceptability gate
+----------------------------------------
+Purpose: Returns al=1 (accept) or al=0 (reject) for whether a lag-comp record
+   is still usable. Computes horizontal distance from record origin to current
+   position and compares against max lag-comp distance [0x4206CDC0].
+Confidence: OBSERVED (disassembly decoded from live memory).
+Direct callers: 0x4148F441 (break_lagcomp_distance_a), 0x4148F7AB
+   (break_lagcomp_distance_b).
+Callees: none (leaf).
+Key instructions (OBSERVED):
+   0x413F94D5: mov edx,[0x4223F428]           ; context
+   0x413F94DB: mov esi,[ecx+0x84]             ; record.tick
+   0x413F94E1: mov al,1                       ; default accept
+   0x413F94E3: cmp [edx+0x16C],esi            ; server_tick == record.tick ?
+   0x413F94E9: je   0x413F9552                ; equal -> accept
+   0x413F94EB: movsd xmm0,[ecx+0x18]          ; record origin x,y (packed)
+   0x413F94F0: mulps xmm0,xmm0
+   0x413F94F6: shufps xmm1,xmm0,0x55
+   0x413F94FA: addss xmm1,xmm0
+   0x413F94FE: xorps xmm0,xmm0
+   0x413F9501: sqrtss xmm0,xmm1               ; horizontal distance
+   0x413F9505: ucomiss xmm0,[0x4206CDC0]      ; max lag-comp distance (=100.0)
+   0x413F950C: jbe  0x413F9552                ; within limit -> accept
+   0x413F950E: ...                            ; reject path, computes scaled value
+Record origin x,y stored at record+0x18. Horizontal distance only.
+Note: overwriting the call at 0x4148F441 with "mov al,0;nop;nop;nop" forces
+al=0 => always reject. UI label "Remove Useless Lag Comp. delay" is inverted
+relative to what the patch does (verified mechanism).
+---- Pseudocode (reconstructed) ----
+bool lagcomp_acceptable(record* r) {
+    ctx = *(uint32_t*)0x4223F428;
+    if (*(uint32_t*)(ctx + 0x16C) == r->tick) return true;
+    float dx = r->origin_x - cur_x;   // actually [ecx+0x18] packed x,y
+    float dy = r->origin_y - cur_y;
+    float dist = sqrtf(dx*dx + dy*dy);
+    if (dist <= *(float*)0x4206CDC0) return true;   // 100.0f
+    ... scaled rejection computation ...
+    return false;   // al ends as 0 on reject path
+}
+
+----------------------------------------
+0x413F9E00 — Record freshness gate (record fetch)
+----------------------------------------
+Purpose: Validates a record against server-tick staleness and writes the tick
+   correction to record+0xAC. Returns record pointer in ecx if fresh, else 0.
+   Contains the exact immediate patched by extrapolation_limit.
+Confidence: OBSERVED.
+Direct callers: 0x4148F2A8, 0x414964F9, 0x41496546, 0x4149F9E1, 0x4149FABA.
+Callees: [eax+0x28] virtual call, 0x41343B20, [ecx+0x34] virtual call.
+Key instructions (OBSERVED):
+   0x413F9EA8: mov eax,[0x4223F428]      ; ctx
+   0x413F9EAD: mov eax,[eax+0x16C]       ; server tick
+   0x413F9EB3: sub eax,[edx+0x84]        ; - record.tick   (edx = record)
+   0x413F9EB9: mov ecx,eax
+   0x413F9EBB: neg ecx
+   0x413F9EBD: cmovs ecx,eax             ; ecx = |delta|
+   0x413F9EC0: cmp ecx,2                 ; <-- extrapolation_limit patch site
+   0x413F9EC3: mov ecx,0
+   0x413F9EC8: ja  0x413F9F0B            ; too stale -> return 0
+   0x413F9ECA: mov eax,[0x424F4B18]      ; tick correction
+   0x413F9ECF: mov [edx+0xac],eax        ; record+0xAC = correction
+   0x413F9ED5: mov ecx,edx               ; return record
+   0x413F9ED7: jmp  0x413F9F0B
+Confirmed by Lua pattern in REFRACTED.lua:213-216:
+   {0xF7,0xD9,0x0F,0x48,0xC8,0x83,0xF9,nil,0xB9,0,0,0,0,0x77} -> addr+7
+   Starting at F7 D9 (neg ecx) = 0x413F9EBB; addr+7 = 0x413F9EC2 = the "02"
+   immediate. Exactly matches binary.
+---- Pseudocode (reconstructed) ----
+record* fetch_record(ring* r, ...) {
+    head = r->head; mask = r->mask; records = r->records;
+    idx = (head - 1) & mask;
+    rec = records[idx];
+    if (rec->flags & 8) goto reject;
+    delta = ctx->server_tick - rec->tick;   // [ctx+0x16C] - [rec+0x84]
+    adelta = abs(delta);
+    if (adelta > 2) goto reject;            // cmp ecx,2 ; ja
+    rec->tick_correction = *(uint32_t*)0x424F4B18;   // [rec+0xAC]
+    return rec;
+reject:
+    return 0;
+}
+
+----------------------------------------
+0x41400BF0 — Geometry / visibility helper
+----------------------------------------
+Purpose: Takes record-derived floats and pointers, fills two out-parameters.
+   Called with 0.2f at one site. NOT a prediction routine.
+Confidence: OBSERVED (call site); T3 (semantics — blocked by obfuscation).
+Direct callers: 0x4148F3EC, 0x4148F5B4.
+Callees: virtual [ecx+0x34], 0x414F2D80.
+Key instructions (OBSERVED):
+   0x41400C1E: mov bl,1
+   0x41400C20: test edi,edi
+   0x41400C22: je  0x41400DBE
+   0x41400C28: mov byte ptr [edi],1      ; out-param write
+   0x41400C2B: jmp  0x41400DBE
+   0x41400C30: cmp dword ptr [0x42241C4C],0
+   0x41400C37: je  0x41400C1E
+   ... later:
+   0x41400C4C: mov eax,[0x4223CA04]
+   0x41400C51: movss xmm0,[eax+0x20]
+   0x41400C56: movss [esp+4],xmm0
+The 0.2f argument at 0x4148F5AC is NOT a prediction horizon; it is an argument
+to this helper (ruled out in PREDICTION_FUNCTION_MAP.md).
+Static tracing ends here: helper jumps to trampoline 0x39C21170 (obfuscated,
+junk bytes + opaque predicates + indirect jumps).
+
+----------------------------------------
+0x413F6B40 — Sibling geometry helper
+----------------------------------------
+Purpose: Same shape as 0x41400BF0; called from three other sites.
+Confidence: OBSERVED (exists); T3 (semantics).
+Callees: ends in jmp to trampoline 0x39C21170. Static tracing dead-ends.
+
+----------------------------------------
+0x4148F180 — Record selection (nearest-record search)
+----------------------------------------
+Purpose: Walks the record ring, skips records with flags&8, computes a 3D
+   euclidean distance from a target origin to each record position (z term uses
+   record.z + record.vz*0.5 half-tick projection), keeps the minimum, returns
+   best record index in eax.
+Confidence: OBSERVED (fully disassembled).
+Direct callers: exactly one, 0x4149789F.
+Callees: 0x413F9E00 (record fetch).
+Key instructions (OBSERVED):
+   Prologue: 0x4148F180 push ebp;push ebx;push edi;push esi;sub esp,0x10
+   Call site args at 0x41497897-0x4149789F:
+       lea edx,[esi+0x10]    ; arg4 = &out_origin
+       push eax               ; arg3 = record index / array element
+       push ecx               ; arg2 = tick-derived value
+       push [esi]             ; arg1 = entity pointer
+       call 0x4148F180
+   Distance metric at 0x4148F46C-0x4148F4B0:
+       mov ecx,[esp+0x30]     ; target origin ptr
+       movss xmm0,[ecx]       ; target.x
+       subss xmm0,[eax]       ; - record.x  (record+0x00)
+       movss xmm1,[eax+0x38]  ; record velocity component
+       mulss xmm1,[0x4205A518]; * 0.5
+       addss xmm1,[eax+8]     ; + record.z  (record+0x08)
+       mulss xmm0,xmm0        ; dx^2
+       movsd xmm2,[ecx+4]     ; target.y,target.z
+       movss xmm3,[eax+4]     ; record.y
+       unpcklps xmm3,xmm1     ; {record.y, predicted_z}
+       subps xmm2,xmm3        ; {dy, dz}
+       mulps xmm2,xmm2
+       addss xmm0,xmm2
+       shufps xmm2,xmm2,0x55
+       addss xmm2,xmm0
+       sqrtss xmm0,xmm2       ; distance
+   SIMD tail 0x4148F640-0x4148F778: vectorized min/max reduction over
+   [0x42504EDC]; not position arithmetic.
+Record layout inferred: +0x00=x, +0x04=y, +0x08=z origin; +0x38 velocity-like;
+   +0x84 tick; +0xAC correction/out-ptr; +0xB0 flags word; +0xB1 flags byte
+   (bit 3 = 0x08 tested).
+---- Pseudocode (reconstructed) ----
+int select_record(entity* ent, int tick_arg, int idx, vec3* out) {
+    // walks ring, skips flags&8, min distance
+    best = -1; best_dist = FLT_MAX;
+    for each record r:
+        if (r->flags & 8) continue;
+        pred_z = r->z + r->vel * 0.5f;      // [0x4205A518] = 0.5f
+        dist = hypot(target - (r->x, r->y, pred_z));
+        if (dist < best_dist) { best_dist = dist; best = r; }
+    *out = best->origin;
+    return best_index;
+}
+
+----------------------------------------
+0x41496DB0 — Lag-comp orchestrator (SEH-wrapped)
+----------------------------------------
+Purpose: SEH-wrapped function (0x160-byte stack frame, handler 0x414B49C0).
+   Assembles the final lag-comp origin as sum of two vector arrays indexed by
+   selected record, stores at [esi+0x10]/[esi+0x18], repoints [esi+0xAC] at
+   it, calls 0x41B70930 then 0x41B6C700 to apply.
+Confidence: OBSERVED (structure); T4 (ordering of two paths unknown).
+Direct callers: exactly one, 0x414AEDC0.
+Callees: 0x4148F180 (at 0x4149789F), 0x41B70930, 0x41B6C700.
+Key instructions (OBSERVED):
+   Prologue: push ebp;mov ebp,esp;and esp,0xFFFFFFF0;sub esp,0x160
+   Exception frame at [esi+0x150] with handler 0x414B49C0.
+   0x414977BC: mov eax,[0x424B03D0]      ; array A base
+   0x414977C1: mov edi,[esi+4]           ; record index
+   0x414977C4: movss xmm0,[eax+edi+8]    ; A[i].z
+   0x414977CA: mov ecx,[esi+0xAC]        ; array B pointer
+   0x414977D0: addss xmm0,[ecx+edi+8]    ; + B[i].z
+   0x414977D6: movsd xmm1,[ecx+edi]      ; B[i].x,y
+   0x414977DB: movsd xmm2,[eax+edi]      ; A[i].x,y
+   0x414977E0: addps xmm2,xmm1           ; A[i]+B[i]
+   0x414977E3: movlps [esi+0x10],xmm2    ; out.x,y
+   0x414977E7: movss [esi+0x18],xmm0     ; out.z
+   0x414977F8: call 0x41B70930
+   0x414977FD: lea edx,[esi+0x10]
+   0x41497802: mov [esi+0xAC],edx        ; out-pointer
+   0x4149780A: call 0x41B6C700           ; apply origin
+   Then at 0x41497872: mov eax,[0x424B03D4]; ... call 0x4148F180 (0x4149789F)
+   Result stored at [esi+4] (0x414978A7).
+Two paths exist (guarded by [0x424B03C0]/[0x424B03D4]/[0x424B03B4]); relative
+ordering UNKNOWN.
+---- Pseudocode (reconstructed) ----
+void lagcomp_orchestrator(...) {
+    // SEH wrapper
+    int idx = ...;
+    vec3 out = arrayA[idx] + arrayB[idx];   // A=[0x424B03D0], B=[esi+0xAC]
+    out_ptr = &out;
+    get_something(edi);                     // 0x41B70930 -> [edi+0x9960]
+    apply_origin(ecx_entity, &out);         // 0x41B6C700
+    idx = select_record(ent, tick_arg, idx, &out);  // 0x4148F180
+    [esi+4] = idx;
+}
+
+----------------------------------------
+0x41B6C700 — Origin apply
+----------------------------------------
+Purpose: Consumes a pointer to an assembled origin and writes it into entity
+   state. SEH-wrapped. Reads [ptr+0x109] flag and [ptr+0xA4] float; reads
+   [0x424B0408], [0x42518540].
+Confidence: OBSERVED call; T4 exact semantics (not independently confirmed).
+Direct callers: 0x412EAB9E, 0x4140CB75, 0x41475716, 0x4147AD66, 0x4147AECB,
+   0x4147FD07, 0x4149780A, 0x414983A3, 0x414C4737, 0x415B3A4F.
+Callees: [0x424B0408] (function pointer).
+Key instructions (OBSERVED):
+   0x41B6C750: test eax,eax      ; eax = arg ptr
+   0x41B6C752: je  0x41B6CB4F
+   0x41B6C758: cmp byte ptr [eax+0x109],0
+   0x41B6C75F: jne 0x41B6C79D
+   0x41B6C764: ucomiss xmm0,[eax+0xA4]
+   0x41B6C76B: jne 0x41B6C79D
+   ... calls [0x424B0408]
+
+----------------------------------------
+0x41B70930 — Small field getter
+----------------------------------------
+Purpose: mov eax,[ecx+0x9960]; ret. Three bytes of real code then int3 padding.
+Confidence: OBSERVED.
+Direct callers: 0x414977F8.
+
+----------------------------------------
+0x41573930 — Vector-to-angle (atan2)
+----------------------------------------
+Purpose: Converts a delta vector to yaw/pitch angles. Calls atan2 at
+   0x4202F7D0. Uses constants [0x4206CEE0], [0x4206CDD8], [0x4205A5C4].
+Confidence: OBSERVED.
+Direct callers: 0x41380AA9, 0x413A9D07, 0x41404066, 0x4140494F, 0x4140697F,
+   0x41406A12.
+Callees: 0x4202F7D0 (atan2).
+Key instructions (OBSERVED):
+   0x41573940: movss xmm4,[ecx+8]
+   0x41573945: subss xmm4,[eax+8]        ; dy
+   0x4157394A: movsd xmm5,qword ptr [ecx]; x,y
+   0x4157394E: movsd xmm0,qword ptr [eax]
+   0x41573952: subps xmm5,xmm0           ; dx,dy delta
+   ... atan2 via 0x4202F7D0 ...
+   0x415739BD: mulss xmm0,[0x4206CEE0]   ; rad->deg
+   0x415739C1: addss xmm1,[0x4206CDD8]   ; offset
+
+----------------------------------------
+0x41573E80 — Angle normalization
+----------------------------------------
+Purpose: Normalizes angle components via calls to 0x42026D1B, clamps to +/-2
+   and +/-1 branches.
+Confidence: OBSERVED.
+Direct callers: 0x41380B74, 0x414049F9, 0x41406995, 0x41407E3A, 0x414957FA,
+   0x4149C101, 0x414BFD18, 0x414C1831.
+Callees: 0x42026D1B (x3).
+
+----------------------------------------
+0x41408800 — memcpy-style aim result apply
+----------------------------------------
+Purpose: Copies a 0x71c-byte aim result struct from src (ecx) to dst (eax).
+   ret 4. Not angle math — pure data copy.
+Confidence: OBSERVED.
+Direct callers: 0x4140D3D7.
+
+----------------------------------------
+0x4140C710 — Aim consumer entry (SEH-wrapped)
+----------------------------------------
+Purpose: Main aim consumer entry. Iterates the entity list at
+   [0x424AFD68] (count at [ecx], valid if count <= 0x2FFFF).
+Confidence: OBSERVED.
+Direct callers: exactly one, 0x41596AA9.
+Callees: (body not fully decoded due to obfuscation after prologue).
+Key instructions (OBSERVED):
+   0x4140C73D: mov eax,[0x424AFD68]      ; entity list base
+   0x4140C742: mov ecx,[eax]             ; count
+   0x4140C744: test ecx,ecx
+   0x4140C746: je  0x4140C76D
+   0x4140C748: cmp ecx,0x2FFFF
+   0x4140C74E: ja  0x4140C76D
+
+----------------------------------------
+0x4140CB75 — Aim position computation
+----------------------------------------
+Purpose: Calls 0x41B6C700 then stores aim output to globals
+   0x425023C8 (double), 0x425023D0 (float), 0x425023EC (float). Reads
+   [0x424F639C] entity context.
+Confidence: OBSERVED.
+Direct callers: none found (may be reached via jump or indirect).
+Callees: 0x41B6C700, 0x41404C60, 0x4140EE00, 0x41408300, 0x41B6FF10,
+   0x414091A0.
+Key instructions (OBSERVED):
+   0x4140CB75: call 0x41B6C700
+   0x4140CB7A: movsd qword ptr [0x425023C8],xmm0   ; aim out X
+   0x4140CB87: movss dword ptr [0x425023D0],xmm0   ; aim out Y
+   ... later:
+   0x4140CC66: movss dword ptr [0x425023EC],xmm0   ; aim out Z-ish
+
+----------------------------------------
+0x41406950–0x41406A75 — Aim angle computation
+----------------------------------------
+Purpose: Computes aim angle from aim position + entity origin; Euclidean
+   distance via sqrtss at 0x41406A5B; calls 0x41573930 (vector->angle).
+Confidence: OBSERVED.
+Direct callers: called from within 0x4140C710 flow (callers of 0x41573930 at
+   0x4140697F and 0x41406A12 confirm this region is reached).
+Callees: 0x41573930, 0x41573E80.
+Key instructions (OBSERVED):
+   0x41406973: push 0x425023C8      ; aim position ptr
+   0x4140697F: call 0x41573930      ; vector->angle
+   0x414069BB: movss [esi+0x2C],xmm0  ; store aim X
+   ... distance computation ...
+   0x41406A5B: sqrtss xmm0,xmm1     ; distance
+
+----------------------------------------
+0x41409D20, 0x414091A0, 0x41407EB0, 0x41403FB0, 0x41408800
+----------------------------------------
+Purpose: Aim-path helper functions called from 0x4140CB75 / 0x4140D3xx region.
+Confidence: OBSERVED (called); T4 (exact role).
+Callers: 0x4140CCBE/CCC7 call 0x41409D20; 0x4140CC8C calls 0x414091A0;
+   0x4140CDD5/CDBE call 0x41407EB0; 0x4140D3C8 calls 0x41403FB0;
+   0x4140D3D7 calls 0x41408800.
+
+----------------------------------------
+0x41596AA9 — Aim consumer caller (no callers found)
+----------------------------------------
+Purpose: Calls into aim pipeline (0x41367250, 0x41412FE0, 0x41427FA0,
+   0x41428C40, 0x41395030) then reaches 0x4140C710 flow. No direct E8
+   callers found — likely reached via jump/indirect or is a hook entry.
+Confidence: OBSERVED (exists); T4 (entry mechanism unknown).
+Key instructions (OBSERVED):
+   0x41596AB4: call 0x41367250
+   0x41596ABF: call 0x41412FE0
+   0x41596AD3: call 0x41427FA0
+   0x41596ADB: call 0x41428C40
+   0x41596AEE: call 0x41395030
+   0x41596AF3: mov eax,[0x4223F428]; ... ; cmp [eax+0x4D30],[0x4223E328]
+
+========================================
+3. CALL GRAPHS
+========================================
+
+A. Lag-compensation path (record selection + origin apply)
+
+   0x414AEDC0  --call-->  0x41496DB0 (orchestrator, SEH)
+   0x41496DB0  --call-->  0x4148F180 (record selection)  [at 0x4149789F]
+   0x4148F180  --call-->  0x413F9E00 (record fetch)       [at 0x4148F2A8]
+   0x41496DB0  --call-->  0x41B70930 (getter)
+   0x41496DB0  --call-->  0x41B6C700 (origin apply)        [at 0x4149780A]
+   0x41B6C700  --call-->  [0x424B0408] (fn ptr)
+
+   Branch points inside 0x41496DB0: guards on [0x424B03C0], [0x424B03D4],
+   [0x424B03B4]. Two paths; relative execution order UNKNOWN (unresolved).
+   Record freshness gate 0x413F94D0 called from 0x4148F441/0x4148F7AB
+   (inside 0x4148F180 region — actually those are separate call sites).
+
+   Note: 0x413F94D0 callers (0x4148F441, 0x4148F7AB) are inside the
+   0x4148F180 function body region but may be inline code rather than the
+   select_record function proper. Both point to the same gate.
+
+B. Aim-consumer path
+
+   0x41596AA9 (entry, no E8 callers found) -->
+     calls 0x41367250, 0x41412FE0, 0x41427FA0, 0x41428C40, 0x41395030 -->
+   0x4140C710 (aim consumer entry, SEH, iterates [0x424AFD68]) -->
+     0x4140CB75 (aim position) -->
+       0x41B6C700 (origin apply) -->
+         [0x424B0408]
+       stores to 0x425023C8/23D0/23EC -->
+     0x41406950-0x41406A75 (aim angle) -->
+       0x41573930 (vector->angle via 0x4202F7D0 atan2) -->
+         0x4202F7D0
+       0x41573E80 (normalize via 0x42026D1B x3) -->
+         0x42026D1B
+     stores result, calls 0x41408800 (memcpy 0x71c bytes) -->
+     result consumed by aim system
+
+   Additional aim-path callees: 0x41409D20 (x2), 0x414091A0, 0x41407EB0,
+   0x41403FB0.
+
+Unresolved relationships:
+- How 0x41596AA9 is entered (no E8 caller; jump/indirect or hook).
+- Exact ordering of the two paths inside 0x41496DB0.
+- Whether 0x4140CB75 is called directly or jumped into.
+- Relationship between aim output globals (0x425023C8/23D0/23EC) and the
+  final aim angle written to engine state.
+
+========================================
+4. DATA-FLOW FINDINGS
+========================================
+
+4.1 Relevant global variables (runtime values read from PID 21580)
+
+   0x4223F428   context pointer            = 0xFC320010 (not in mapped image)
+   0x4223F428+0x16C server tick           = 0 (not in active match)
+   0x424F4B18   tick correction           = 1
+   0x424F4B7C   tick accumulator          = 0x22B8F (142223)
+   0x424B1C74   tick base                 = 0
+   0x4206CDC0   max lag-comp distance     = 100.0f
+   0x4205AC74   tick-rate divisor         = 64.0f
+   0x4205A9FC   lag-comp time budget      = 0.2f  (200 ms)
+   0x42077FC8   lerp window constant      = 0.078125f (= 5/64, ~5 ticks @64)
+   0x4205A518   half-tick factor          = 0.5f
+   0x4205AC78   FLT_MAX                   = 3.4028e38
+   0x4223CA04   scale object ptr          = 0x5844EE60; +0x20 = float scale
+   0x424AFD68   entity list ptr           = 0x2AD0F6D8; [0]=0 currently
+   0x42518540   TLS/thread index          = 0x35
+   0x42262700   stack cookie              = 0x09BF8CED4
+   0x42501CA4   interface ptr             = 0x335147C0
+   0x42241C4C   mode flag                 = 1
+   0x42500930..0x42500A04 various (all 0 at rest)
+   Aim output globals:
+     0x425023C8  aim out X  (double)
+     0x425023D0  aim out Y  (float)
+     0x425023EC  aim out Z/other (float)
+     0x425023BC  aim active flag (byte)
+     0x42502408  aim state dword
+     0x4250240C  aim state dword
+     0x4250241C  aim state dword
+     0x42502B0C  aim flag (byte)
+
+   Most globals are 0 at rest because the cheat is not in an active match;
+   these are observed live values, not in-game values.
+
+4.2 Structures (known sizes / layouts)
+
+   lag_record_t (from MUST UPDATE.txt FFI cdef, lines 7-40):
+     +0x00  float* origin
+     +0x04  float* velocity
+     +0x08  float* abs_velocity
+     +0x0C  float  simulation_time
+     +0x10  float* mins
+     +0x14  float  maxs_x
+     +0x18  float  maxs_y
+     +0x1C  float  aim_yaw_max
+     +0x20  int    choked_ticks
+     +0x24  char   pad_44[24]
+     +0x3C  float  desync_weight
+     +0x40  char   pad_60[4]
+     +0x44  float  eye_pitch
+     +0x48  float  abs_yaw
+     +0x4C  float  body_yaw
+     +0x50  float* view_offset
+     +0x54  float  origin_prev_x
+     +0x58  float  origin_prev_y
+     +0x5C  int    server_tick
+     +0x60  char   pad_88[12]
+     +0x6C  float  lagcomp_simtime
+     +0x70  float  duck_amount
+     +0x74  char   pad_9C[4]
+     +0x78  float  maxs_z
+     +0x7C  int    lagcomp_valid
+     +0x80  char   pad_A8[4]
+     +0x84  int    extrap_cleared
+     +0x88  int    record_flags
+     +0x8C  char   pad_B4[4]
+     +0x90  void*  anim
+
+   lag_ringbuf_t (MUST UPDATE.txt lines 42-48):
+     +0x00  void* pad
+     +0x04  lag_record_t** records
+     +0x08  int   capacity
+     +0x0C  int   head
+     +0x10  int   count
+
+   Engine record layout (inferred from disassembly, PREDICTION_DATA_FLOW.md):
+     rec+0x00/04/08 origin x/y/z
+     rec+0x18/1C/20 second origin x,y (packed at +0x18 as movsd)
+     rec+0x38 velocity-like scalar
+     rec+0x84 record tick
+     rec+0x94 float (passed to geometry helper)
+     rec+0xA4 geometry sub-structure start
+     rec+0xAC tick correction / out-pointer
+     rec+0xB0 flags word; rec+0xB1 flags byte (bit 3 = 0x08)
+
+   Note: lag_record_t (FFI) and engine record layout are DIFFERENT structures;
+   do not conflate them. The FFI struct is what MUST UPDATE.txt reads via
+   FFI; the engine layout is what the native code uses internally.
+
+4.3 Reads and writes (verified)
+
+   Reads of entity list: [0x424AFD68] -> count at [ecx]; entities at
+   [ecx + i*4] pattern (seen in 0x4140C710 flow).
+   Writes to aim output globals: 0x425023C8 (0x4140CB7A), 0x425023D0
+   (0x4140CB90), 0x425023EC (0x4140CC66).
+   Writes to record+0xAC: 0x413F9ECF (tick correction).
+   Origin assembly: 0x414977C4-0x414977E7 writes [esi+0x10] (x,y) and
+   [esi+0x18] (z); [esi+0xAC] repointed to &[esi+0x10].
+   Aim result copy: 0x41408800 copies 0x71c bytes src->dst.
+
+4.4 Data dependencies
+
+   Aim position (0x425023C8/23D0/23EC) depends on:
+     - 0x41B6C700 output (entity state pointer)
+     - [0x424F639C] entity context
+   Aim angle depends on:
+     - aim position + entity origin (0x41406950 region)
+   Lag-comp origin depends on:
+     - record selection (0x4148F180) -> array A [0x424B03D0] + array B
+       ([esi+0xAC]) indexed by record index
+   Record freshness depends on:
+     - |server_tick - record.tick| <= extrapolation_limit (stock 2)
+
+========================================
+5. NATIVE/LUA ARCHITECTURE
+========================================
+
+5.1 Confirmed boundaries
+
+   Native -> Lua: NONE verified. No getter bindings expose native aim
+   output, record selection, or engine records to Lua.
+   Lua -> Native: FFI only, via MUST UPDATE.txt memory struct:
+     - VirtualQuery, VirtualProtect, VirtualAlloc, VirtualFree
+     - FlushInstructionCache, GetCurrentProcess
+     - scan_memory (pattern scan over all executable pages)
+     - scan_nl / scan_nl_all (scan mapped cheat region [base, base+delta))
+     - save_memory (read bytes)
+     - byte_patch (write bytes to native code)
+     - All exposed through `memory` object in MUST UPDATE.txt
+
+5.2 Available interfaces (Lua side)
+
+   lagrecord library (FemboyLose-main/libraries/open_source/lagrecord.lua):
+     - set_update_callback(fn)   -> boolean filter (player -> bool)
+     - unset_update_callback(fn)
+     - get_player_data(player)   -> DEFINED, UNUSED
+     - get_all(player)           -> DEFINED, UNUSED
+     - get_record(player, idx)   -> DEFINED, UNUSED
+     - get_snapshot(player, idx) -> DEFINED, UNUSED
+     - get_server_time()         -> globals.client_tick + clock_offset
+                                   + engine.dll FFI delta
+   These getters have ZERO callers across all workspace Lua (grep verified).
+   Only set_update_callback is used (github_bebrasense.lua:34-38, as filter).
+
+5.3 Unavailable interfaces
+
+   - No Lua binding to read native aim output (0x425023C8/23D0/23EC).
+   - No Lua binding to call 0x4140C710, 0x4140CB75, or any aim function.
+   - No Lua binding to read engine record ring or record selection result.
+   - No documented native->Lua callback for aim results.
+
+5.4 Lua-side findings relevant to native boundary
+
+   - MUST UPDATE.txt defines lag_record_t / lag_ringbuf_t FFI structs and
+     patches native memory directly (extrapolation_limit, break_lagcomp
+     distance, lerp_records, etc.). These are byte patches, not data reads.
+   - extrapolate_pos (Aesthetic BETA.txt:1617): origin + velocity*(1/64)*ticks,
+     hardcoded 64-tick; does NOT read globals.tickinterval.
+   - rebelion v751 (rebelion.txt:4871): origin + velocity*tickinterval*delta,
+     delta = sim.current - sim.old; result used for render box only (4907),
+     NOT aim.
+   - REFRACTED.lua:2238 explicitly states motion values come from
+     net_update_end samples, "not the game's internal extrapolation vector."
+   - REFRACTED.lua:213-216 Lua pattern for extrapolation_limit confirms
+     binary address 0x413F9EC2 (T1 correlation with binary).
+
+========================================
+6. DISASSEMBLY AND PSEUDOCODE
+========================================
+
+All disassembly below was read from live process memory (PID 21580) via
+ReadProcessMemory and decoded with capstone 5.0.7. Pseudocode is my own
+reconstruction and is marked as such. No instructions were invented.
+
+----------------------------------------
+6.1 0x413F9E00 record freshness gate (OBSERVED disassembly)
+----------------------------------------
+   0x413F9EA8: a128f42342       mov eax, dword ptr [0x4223F428]
+   0x413F9EAD: 8b806c010000     mov eax, dword ptr [eax+0x16C]
+   0x413F9EB3: 2b8284000000     sub eax, dword ptr [edx+0x84]
+   0x413F9EB9: 89c1             mov ecx, eax
+   0x413F9EBB: f7d9             neg ecx
+   0x413F9EBD: 0f48c8           cmovs ecx, eax
+   0x413F9EC0: 83f902           cmp ecx, 2
+   0x413F9EC3: b900000000       mov ecx, 0
+   0x413F9EC8: 7741             ja 0x413F9F0B
+   0x413F9ECA: a1184b4f42       mov eax, dword ptr [0x424F4B18]
+   0x413F9ECF: 8982ac000000     mov dword ptr [edx+0xAC], eax
+   0x413F9ED5: 89d1             mov ecx, edx
+   0x413F9ED7: eb32             jmp 0x413F9F0B
+
+----------------------------------------
+6.2 0x413F94D0 lag-comp acceptability gate (OBSERVED disassembly)
+----------------------------------------
+   0x413F94D5: 8b1528f42342     mov edx, dword ptr [0x4223F428]
+   0x413F94DB: 8bb184000000     mov esi, dword ptr [ecx+0x84]
+   0x413F94E1: b001             mov al, 1
+   0x413F94E3: 39b26c010000     cmp dword ptr [edx+0x16C], esi
+   0x413F94E9: 7467             je 0x413F9552
+   0x413F94EB: f20f104118       movsd xmm0, qword ptr [ecx+0x18]
+   0x413F94F0: 0f59c0           mulps xmm0, xmm0
+   0x413F94F6: 0fc6c855         shufps xmm1, xmm0, 0x55
+   0x413F94FA: f30f58c8         addss xmm1, xmm0
+   0x413F94FE: 0f57c0           xorps xmm0, xmm0
+   0x413F9501: f30f51c1         sqrtss xmm0, xmm1
+   0x413F9505: 0f2e05c0cd0642   ucomiss xmm0, dword ptr [0x4206CDC0]
+   0x413F950C: 7644             jbe 0x413F9552
+
+----------------------------------------
+6.3 0x4148F180 record selection prologue + distance metric (OBSERVED)
+----------------------------------------
+   Prologue:
+   0x4148F180: 55               push ebp
+   0x4148F181: 53               push ebx
+   0x4148F182: 57               push edi
+   0x4148F183: 56               push esi
+   0x4148F184: 83ec10           sub esp, 0x10
+
+   Call site (0x41497897-0x4149789F):
+   0x41497897: 8d5610           lea edx, [esi+0x10]
+   0x4149789A: 52               push edx
+   0x4149789B: 50               push eax
+   0x4149789C: 51               push ecx
+   0x4149789D: ff36             push dword ptr [esi]
+   0x4149789F: e8dc78ffff       call 0x4148F180
+
+   Distance metric (0x4148F46C-0x4148F4B0):
+   0x4148F46C: 8b4c2430         mov ecx, dword ptr [esp+0x30]
+   0x4148F470: f30f1001         movss xmm0, dword ptr [ecx]
+   0x4148F474: f30f5c00         subss xmm0, dword ptr [eax]
+   0x4148F478: f30f104838       movss xmm1, dword ptr [eax+0x38]
+   0x4148F47D: f30f590d18a50542 mulss xmm1, dword ptr [0x4205A518]
+   0x4148F485: f30f584808       addss xmm1, dword ptr [eax+8]
+   0x4148F48A: f30f59c0         mulss xmm0, xmm0
+   0x4148F48E: f20f105104       movsd xmm2, qword ptr [ecx+4]
+   0x4148F493: f30f105804       movss xmm3, dword ptr [eax+4]
+   0x4148F498: 0f14d9           unpcklps xmm3, xmm1
+   0x4148F49B: 0f5cd3           subps xmm2, xmm3
+   0x4148F49E: 0f59d2           mulps xmm2, xmm2
+   0x4148F4A1: f30f58c2         addss xmm0, xmm2
+   0x4148F4A5: 0fc6d255         shufps xmm2, xmm2, 0x55
+   0x4148F4A9: f30f58d0         addss xmm2, xmm0
+   0x4148F4AD: 0f57c0           xorps xmm0, xmm0
+   0x4148F4B0: f30f51c2         sqrtss xmm0, xmm2
+
+----------------------------------------
+6.4 0x41496DB0 lag-comp orchestrator origin assembly (OBSERVED)
+----------------------------------------
+   0x414977BC: a1d0034b42       mov eax, dword ptr [0x424B03D0]
+   0x414977C1: 8b7e04           mov edi, dword ptr [esi+4]
+   0x414977C4: f30f10443808     movss xmm0, dword ptr [eax+edi+8]
+   0x414977CA: 8b8eac000000     mov ecx, dword ptr [esi+0xAC]
+   0x414977D0: f30f58443908     addss xmm0, dword ptr [ecx+edi+8]
+   0x414977D6: f20f100c39       movsd xmm1, qword ptr [ecx+edi]
+   0x414977DB: f20f101438       movsd xmm2, qword ptr [eax+edi]
+   0x414977E0: 0f58d1           addps xmm2, xmm1
+   0x414977E3: 0f135610         movlps qword ptr [esi+0x10], xmm2
+   0x414977E7: f30f114618       movss dword ptr [esi+0x18], xmm0
+   0x414977F8: e833916d00       call 0x41B70930
+   0x414977FD: 8d5610           lea edx, [esi+0x10]
+   0x41497802: 8996ac000000     mov dword ptr [esi+0xAC], edx
+   0x4149780A: e8f14e6d00       call 0x41B6C700
+
+----------------------------------------
+6.5 0x4140C710 aim consumer entry prologue (OBSERVED)
+----------------------------------------
+   0x4140C710: 55               push ebp
+   0x4140C711: 89e5             mov ebp, esp
+   0x4140C713: 53               push ebx
+   0x4140C714: 57               push edi
+   0x4140C715: 56               push esi
+   0x4140C716: 83ec34           sub esp, 0x34
+   0x4140C719: 8965e4           mov dword ptr [ebp-0x1C], esp
+   0x4140C71C: c745f0ffffffff   mov dword ptr [ebp-0x10], 0xFFFFFFFF
+   0x4140C723: 8d45e8           lea eax, [ebp-0x18]
+   0x4140C726: c745ec80914041   mov dword ptr [ebp-0x14], 0x41409180
+   0x4140C72D: 648b0d00000000   mov ecx, dword ptr fs:[0]
+   0x4140C734: 894de8           mov dword ptr [ebp-0x18], ecx
+   0x4140C737: 64a300000000     mov dword ptr fs:[0], eax
+   0x4140C73D: a168fd4a42       mov eax, dword ptr [0x424AFD68]
+   0x4140C742: 8b08             mov ecx, dword ptr [eax]
+   0x4140C744: 85c9             test ecx, ecx
+   0x4140C746: 7425             je 0x4140C76D
+   0x4140C748: 81f9ffff0200     cmp ecx, 0x2FFFF
+   0x4140C74E: 771d             ja 0x4140C76D
+
+----------------------------------------
+6.6 0x4140CB75 aim position computation (OBSERVED)
+----------------------------------------
+   0x4140CB75: e886fb7500       call 0x41B6C700
+   0x4140CB7A: f20f1045d0       movsd xmm0, qword ptr [ebp-0x30]
+   0x4140CB7F: f20f1105c8235042 movsd qword ptr [0x425023C8], xmm0
+   0x4140CB87: f30f1045d8       movss xmm0, dword ptr [ebp-0x28]
+   0x4140CB8C: f30f1105d0235042 movss dword ptr [0x425023D0], xmm0
+   ...
+   0x4140CC66: f30f1105ec235042 movss dword ptr [0x425023EC], xmm0
+
+----------------------------------------
+6.7 0x41406950-0x41406A75 aim angle computation (OBSERVED excerpt)
+----------------------------------------
+   0x41406973: 68c8235042       push 0x425023C8
+   0x4140697F: e8accf1600       call 0x41573930
+   0x414069BB: f30f11462c       movss dword ptr [esi+0x2C], xmm0
+   ...
+   0x41406A5B: f30f51c1         sqrtss xmm0, xmm1
+
+----------------------------------------
+6.8 0x41573930 vector->angle (OBSERVED excerpt)
+----------------------------------------
+   0x41573940: f30f106108       movss xmm4, dword ptr [ecx+8]
+   0x41573945: f30f5c6008       subss xmm4, dword ptr [eax+8]
+   0x4157394A: f20f1029         movsd xmm5, qword ptr [ecx]
+   0x4157394E: f20f1000         movsd xmm0, qword ptr [eax]
+   0x41573952: 0f5ce8           subps xmm5, xmm0
+   ... calls 0x4202F7D0 (atan2) ...
+   0x415739BD: f30f5905e0ce0642 mulss xmm0, dword ptr [0x4206CEE0]
+   0x415739C5: f30f58c8         addss xmm1, xmm0
+
+----------------------------------------
+6.9 0x41573E80 angle normalize (OBSERVED excerpt)
+----------------------------------------
+   0x41573E84: 8b442440         mov eax, dword ptr [esp+0x40]
+   0x41573E88: 8b4c2444         mov ecx, dword ptr [esp+0x44]
+   ... calls 0x42026D1B x3 ...
+
+----------------------------------------
+6.10 0x41408800 memcpy-style apply (OBSERVED)
+----------------------------------------
+   0x41408800: 89c8             mov eax, ecx
+   0x41408802: 8b4c2404         mov ecx, dword ptr [esp+4]
+   0x41408806: f20f1001         movsd xmm0, qword ptr [ecx]
+   0x4140880A: f20f1100         movsd qword ptr [eax], xmm0
+   ... copies 0x71c bytes ...
+   0x414088C9: f20f1081fc060000 movsd xmm0, qword ptr [ecx+0x6FC]
+   0x414088D1: f20f1180fc060000 movsd qword ptr [eax+0x6FC], xmm0
+   0x414088D9: c20400           ret 4
+
+========================================
+7. EVIDENCE AND LIMITATIONS
+========================================
+
+7.1 Verified through live memory analysis (OBSERVED)
+
+   - Module base 0x412A0000, size 0x00DBA000, protection WCX (PID 21580).
+   - All function addresses and instructions listed in Section 2 were decoded
+     from live memory via ReadProcessMemory + capstone.
+   - All global variable runtime values (Section 4.1) read from live memory.
+   - Caller/callee relationships (Section 3) established by E8 rel32 scan
+     over the full mapped image.
+   - MUST UPDATE.txt Lua pattern for extrapolation_limit (addr+7 = immediate
+     02 at 0x413F9EC2) matches binary exactly — T1 Lua<->binary correlation.
+   - csgo.exe confirmed running (PID 21580 at time of analysis).
+
+7.2 Established through static analysis
+
+   - neverlose.dll on disk is a loader stub (0 pattern matches).
+   - FemboyLose-main/ is loader source, not cheat core.
+   - bins\nl.bin is Lua stdlib only (no aim strings).
+   - lagrecord.lua getters are defined but uncalled (grep verified).
+   - QueryLuaLibrary fetches Lua scripts remotely via /lua/<name>.
+
+7.3 Hypotheses / unresolved (NOT facts)
+
+   - Exact semantics of record+0x38 (velocity-like) — inferred from
+     `mulss by 0.5 + record.z` pattern (T4).
+   - Relationship between record+0x00 and record+0x18 origins — unknown.
+   - Meaning of 0x424F4B18 beyond being written to record+0xAC — unknown;
+     86 read-only xrefs, no writes found.
+   - Behavior behind trampoline 0x39C21170 (helpers 0x41400BF0 / 0x413F6B40)
+     — static tracing dead-ends.
+   - Ordering of the two paths inside 0x41496DB0 — unknown.
+   - How 0x41596AA9 is entered (no E8 caller found).
+   - Whether aim output globals feed directly into engine aim state or an
+     intermediate step.
+
+7.4 Missing source code
+
+   - Native cheat core source: NOT available in workspace. Only the compiled
+     mapped module at 0x412A0000 exists. All native findings are from live
+     memory disassembly, not source.
+   - FemboyLose-main is the loader/injector source only.
+   - Rust server code is networking/auth, unrelated to cheat aim logic.
+   - No upstream repository, branch, tag, submodule, or release asset in the
+     workspace contains the cheat core source.
+
+7.5 What was NOT done
+
+   - No process memory was written (no patches applied in this session).
+   - No binary or source file was modified.
+   - No new investigation was performed for this document; all content is an
+     export of previously established findings.
+   - MUST UPDATE.txt was not modified; SHA256 verified unchanged:
+     6929460819DC7B5A4087B73DAAF7C8F6580D0B4122046D637A222FA7EEA6BB29.
+
+========================================
+END OF DUMP
+========================================
